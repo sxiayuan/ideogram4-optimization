@@ -16,6 +16,7 @@ from ideogram4.magic_prompt import (
   aspect_ratio_from_size,
 )
 from ideogram4.pipeline_ideogram4 import (
+  CFGBenchmarkResult,
   Ideogram4Pipeline,
   Ideogram4PipelineConfig,
 )
@@ -24,6 +25,7 @@ from ideogram4.sampler_configs import PRESETS
 from ideogram4.scheduler import SamplerParameters
 
 __all__ = [
+  "CFGBenchmarkResult",
   "DEFAULT_MAGIC_PROMPT",
   "ClaudeOpusMagicPromptV1",
   "ClaudeSonnetMagicPromptV1",

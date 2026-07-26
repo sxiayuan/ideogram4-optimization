@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import time
 import warnings
 from dataclasses import dataclass
 from posixpath import dirname as _posix_dirname, join as _posix_join
@@ -227,6 +228,18 @@ def _load_indexed_or_single_state_dict(
     single_filename = index_filename.removesuffix(".index.json")
     single_path = hf_hub_download(repo_id=repo_id, filename=single_filename)
     return load_file(single_path)
+
+
+@dataclass
+class CFGBenchmarkResult:
+  """Timing and numerical equivalence for sequential vs batched CFG."""
+
+  separate_ms_per_step: float
+  batched_ms_per_step: float
+  speedup: float
+  max_latent_diff: float
+  num_steps: int
+  num_warmup: int
 
 
 @dataclass
@@ -500,6 +513,339 @@ class Ideogram4Pipeline:
       raise ValueError(combined)
     warnings.warn(combined, stacklevel=2)
 
+  @staticmethod
+  def _synchronize_device(device: torch.device) -> None:
+    if device.type == "cuda":
+      torch.cuda.synchronize(device)
+    elif device.type == "mps":
+      torch.mps.synchronize()
+
+  def _cfg_forward_separate(
+    self,
+    *,
+    llm_features: torch.Tensor,
+    z: torch.Tensor,
+    t: torch.Tensor,
+    text_z_padding: torch.Tensor,
+    max_text_tokens: int,
+    position_ids: torch.Tensor,
+    segment_ids: torch.Tensor,
+    indicator: torch.Tensor,
+    neg_llm_features: torch.Tensor,
+    neg_position_ids: torch.Tensor,
+    neg_segment_ids: torch.Tensor,
+    neg_indicator: torch.Tensor,
+  ) -> tuple[torch.Tensor, torch.Tensor]:
+    """Run conditional and unconditional transformer forwards sequentially."""
+    pos_z = torch.cat([text_z_padding, z], dim=1)
+    pos_out = self.conditional_transformer(
+      llm_features=llm_features,
+      x=pos_z,
+      t=t,
+      position_ids=position_ids,
+      segment_ids=segment_ids,
+      indicator=indicator,
+    )
+    pos_v = pos_out[:, max_text_tokens:]
+
+    neg_v = self.unconditional_transformer(
+      llm_features=neg_llm_features,
+      x=z,
+      t=t,
+      position_ids=neg_position_ids,
+      segment_ids=neg_segment_ids,
+      indicator=neg_indicator,
+    )
+    return pos_v, neg_v
+
+  def _cfg_forward_batched(
+    self,
+    *,
+    llm_features: torch.Tensor,
+    z: torch.Tensor,
+    t: torch.Tensor,
+    text_z_padding: torch.Tensor,
+    max_text_tokens: int,
+    position_ids: torch.Tensor,
+    segment_ids: torch.Tensor,
+    indicator: torch.Tensor,
+    neg_llm_features: torch.Tensor,
+    neg_position_ids: torch.Tensor,
+    neg_segment_ids: torch.Tensor,
+    neg_indicator: torch.Tensor,
+  ) -> tuple[torch.Tensor, torch.Tensor]:
+    """Run conditional and unconditional forwards in one batched CFG step.
+
+    On CUDA, both transformer forwards are dispatched together on separate
+    streams so their kernels can overlap. Numerically this matches the
+    sequential path: each branch still uses its own weights and inputs.
+    """
+    pos_z = torch.cat([text_z_padding, z], dim=1)
+
+    if self.device.type != "cuda":
+      return self._cfg_forward_separate(
+        llm_features=llm_features,
+        z=z,
+        t=t,
+        text_z_padding=text_z_padding,
+        max_text_tokens=max_text_tokens,
+        position_ids=position_ids,
+        segment_ids=segment_ids,
+        indicator=indicator,
+        neg_llm_features=neg_llm_features,
+        neg_position_ids=neg_position_ids,
+        neg_segment_ids=neg_segment_ids,
+        neg_indicator=neg_indicator,
+      )
+
+    pos_stream = torch.cuda.Stream(device=self.device)
+    neg_stream = torch.cuda.Stream(device=self.device)
+    pos_v: torch.Tensor | None = None
+    neg_v: torch.Tensor | None = None
+
+    with torch.cuda.stream(pos_stream):
+      pos_out = self.conditional_transformer(
+        llm_features=llm_features,
+        x=pos_z,
+        t=t,
+        position_ids=position_ids,
+        segment_ids=segment_ids,
+        indicator=indicator,
+      )
+      pos_v = pos_out[:, max_text_tokens:]
+
+    with torch.cuda.stream(neg_stream):
+      neg_v = self.unconditional_transformer(
+        llm_features=neg_llm_features,
+        x=z,
+        t=t,
+        position_ids=neg_position_ids,
+        segment_ids=neg_segment_ids,
+        indicator=neg_indicator,
+      )
+
+    torch.cuda.current_stream(self.device).wait_stream(pos_stream)
+    torch.cuda.current_stream(self.device).wait_stream(neg_stream)
+    assert pos_v is not None and neg_v is not None
+    return pos_v, neg_v
+
+  def _cfg_forward(
+    self,
+    *,
+    use_batched_cfg: bool,
+    llm_features: torch.Tensor,
+    z: torch.Tensor,
+    t: torch.Tensor,
+    text_z_padding: torch.Tensor,
+    max_text_tokens: int,
+    position_ids: torch.Tensor,
+    segment_ids: torch.Tensor,
+    indicator: torch.Tensor,
+    neg_llm_features: torch.Tensor,
+    neg_position_ids: torch.Tensor,
+    neg_segment_ids: torch.Tensor,
+    neg_indicator: torch.Tensor,
+  ) -> tuple[torch.Tensor, torch.Tensor]:
+    if use_batched_cfg:
+      return self._cfg_forward_batched(
+        llm_features=llm_features,
+        z=z,
+        t=t,
+        text_z_padding=text_z_padding,
+        max_text_tokens=max_text_tokens,
+        position_ids=position_ids,
+        segment_ids=segment_ids,
+        indicator=indicator,
+        neg_llm_features=neg_llm_features,
+        neg_position_ids=neg_position_ids,
+        neg_segment_ids=neg_segment_ids,
+        neg_indicator=neg_indicator,
+      )
+    return self._cfg_forward_separate(
+      llm_features=llm_features,
+      z=z,
+      t=t,
+      text_z_padding=text_z_padding,
+      max_text_tokens=max_text_tokens,
+      position_ids=position_ids,
+      segment_ids=segment_ids,
+      indicator=indicator,
+      neg_llm_features=neg_llm_features,
+      neg_position_ids=neg_position_ids,
+      neg_segment_ids=neg_segment_ids,
+      neg_indicator=neg_indicator,
+    )
+
+  def _denoise(
+    self,
+    *,
+    z: torch.Tensor,
+    text_z_padding: torch.Tensor,
+    llm_features: torch.Tensor,
+    neg_llm_features: torch.Tensor,
+    inputs: dict[str, torch.Tensor | int],
+    max_text_tokens: int,
+    num_steps: int,
+    schedule: LogitNormalSchedule,
+    step_intervals: torch.Tensor,
+    gw_per_step: torch.Tensor,
+    use_batched_cfg: bool = False,
+    cfg_step_times_s: list[float] | None = None,
+  ) -> torch.Tensor:
+    neg_position_ids = inputs["position_ids"][:, max_text_tokens:]  # type: ignore[index]
+    neg_segment_ids = inputs["segment_ids"][:, max_text_tokens:]  # type: ignore[index]
+    neg_indicator = inputs["indicator"][:, max_text_tokens:]  # type: ignore[index]
+    batch_size = z.shape[0]
+
+    for i in range(num_steps - 1, -1, -1):
+      t_val = float(schedule(step_intervals[i + 1].unsqueeze(0)).item())
+      s_val = float(schedule(step_intervals[i].unsqueeze(0)).item())
+      t = torch.full((batch_size,), t_val, dtype=torch.float32, device=self.device)
+
+      if cfg_step_times_s is not None:
+        self._synchronize_device(self.device)
+        step_start = time.perf_counter()
+
+      pos_v, neg_v = self._cfg_forward(
+        use_batched_cfg=use_batched_cfg,
+        llm_features=llm_features,
+        z=z,
+        t=t,
+        text_z_padding=text_z_padding,
+        max_text_tokens=max_text_tokens,
+        position_ids=inputs["position_ids"],  # type: ignore[arg-type]
+        segment_ids=inputs["segment_ids"],  # type: ignore[arg-type]
+        indicator=inputs["indicator"],  # type: ignore[arg-type]
+        neg_llm_features=neg_llm_features,
+        neg_position_ids=neg_position_ids,
+        neg_segment_ids=neg_segment_ids,
+        neg_indicator=neg_indicator,
+      )
+
+      if cfg_step_times_s is not None:
+        self._synchronize_device(self.device)
+        cfg_step_times_s.append(time.perf_counter() - step_start)
+
+      gw_i = gw_per_step[i]
+      v = gw_i * pos_v + (1.0 - gw_i) * neg_v
+      delta = s_val - t_val
+      z = z + v * delta
+
+    return z
+
+  @torch.no_grad()
+  def benchmark_cfg(
+    self,
+    prompts: str | list[str],
+    *,
+    height: int = 512,
+    width: int = 512,
+    num_steps: int = 20,
+    num_warmup: int = 3,
+    guidance_scale: float = 7.0,
+    mu: float = 0.5,
+    std: float = 1.0,
+    seed: int = 0,
+    raise_on_caption_issues: bool = False,
+  ) -> CFGBenchmarkResult:
+    """Compare sequential vs batched CFG transformer timing and equivalence."""
+    if isinstance(prompts, str):
+      prompts = [prompts]
+
+    self._verify_prompts(prompts, raise_on_issues=raise_on_caption_issues)
+
+    schedule = get_schedule_for_resolution((height, width), known_mean=mu, std=std)
+    step_intervals = make_step_intervals(num_steps).to(self.device)
+    gw_per_step = torch.full(
+      (num_steps,), float(guidance_scale), dtype=torch.float32, device=self.device
+    )
+
+    inputs = self._build_inputs(prompts, height=height, width=width)
+    batch_size = len(prompts)
+    num_image_tokens = inputs["num_image_tokens"]
+    max_text_tokens = inputs["max_text_tokens"]
+    latent_dim = self.conditional_transformer.config.in_channels
+
+    llm_features = self._encode_text(
+      inputs["token_ids"], inputs["text_position_ids"], inputs["indicator"]  # type: ignore[arg-type]
+    )
+    neg_llm_features = torch.zeros(  # type: ignore[call-overload]
+      batch_size,
+      num_image_tokens,
+      llm_features.shape[-1],
+      dtype=llm_features.dtype,
+      device=self.device,
+    )
+    text_z_padding = torch.zeros(  # type: ignore[call-overload]
+      batch_size,
+      max_text_tokens,
+      latent_dim,
+      dtype=torch.float32,
+      device=self.device,
+    )
+
+    def _make_noise() -> torch.Tensor:
+      generator = torch.Generator(device=self.device)
+      generator.manual_seed(seed)
+      return torch.randn(  # type: ignore[call-overload]
+        batch_size,
+        num_image_tokens,
+        latent_dim,
+        dtype=torch.float32,
+        device=self.device,
+        generator=generator,
+      )
+
+    denoise_kwargs = dict(
+      text_z_padding=text_z_padding,
+      llm_features=llm_features,
+      neg_llm_features=neg_llm_features,
+      inputs=inputs,
+      max_text_tokens=max_text_tokens,
+      num_steps=num_steps,
+      schedule=schedule,
+      step_intervals=step_intervals,
+      gw_per_step=gw_per_step,
+    )
+
+    for _ in range(num_warmup):
+      z_w = _make_noise()
+      self._denoise(z=z_w, use_batched_cfg=False, **denoise_kwargs)
+      z_w = _make_noise()
+      self._denoise(z=z_w, use_batched_cfg=True, **denoise_kwargs)
+
+    separate_times: list[float] = []
+    z_separate = _make_noise()
+    z_separate = self._denoise(
+      z=z_separate,
+      use_batched_cfg=False,
+      cfg_step_times_s=separate_times,
+      **denoise_kwargs,
+    )
+
+    batched_times: list[float] = []
+    z_batched = _make_noise()
+    z_batched = self._denoise(
+      z=z_batched,
+      use_batched_cfg=True,
+      cfg_step_times_s=batched_times,
+      **denoise_kwargs,
+    )
+
+    max_latent_diff = float((z_separate - z_batched).abs().max().item())
+    separate_ms = 1000.0 * sum(separate_times) / len(separate_times)
+    batched_ms = 1000.0 * sum(batched_times) / len(batched_times)
+    speedup = separate_ms / batched_ms if batched_ms > 0 else float("inf")
+
+    return CFGBenchmarkResult(
+      separate_ms_per_step=separate_ms,
+      batched_ms_per_step=batched_ms,
+      speedup=speedup,
+      max_latent_diff=max_latent_diff,
+      num_steps=num_steps,
+      num_warmup=num_warmup,
+    )
+
   @torch.no_grad()
   def __call__(
     self,
@@ -515,6 +861,8 @@ class Ideogram4Pipeline:
     seed: Optional[int] = None,
     schedule: Optional[LogitNormalSchedule] = None,
     raise_on_caption_issues: bool = True,
+    use_batched_cfg: bool = False,
+    profile_cfg: bool = False,
   ) -> list[Image.Image]:
     """Generate images for the given prompts."""
     if isinstance(prompts, str):
@@ -553,9 +901,6 @@ class Ideogram4Pipeline:
     )
 
     # Negative branch is image-only (asymmetric CFG) with zeroed conditioning.
-    neg_position_ids = inputs["position_ids"][:, max_text_tokens:]
-    neg_segment_ids = inputs["segment_ids"][:, max_text_tokens:]
-    neg_indicator = inputs["indicator"][:, max_text_tokens:]
     neg_llm_features = torch.zeros(  # type: ignore[call-overload]
       batch_size,
       num_image_tokens,
@@ -584,35 +929,30 @@ class Ideogram4Pipeline:
       device=self.device,
     )
 
-    for i in range(num_steps - 1, -1, -1):
-      t_val = float(schedule(step_intervals[i + 1].unsqueeze(0)).item())
-      s_val = float(schedule(step_intervals[i].unsqueeze(0)).item())
-      t = torch.full((batch_size,), t_val, dtype=torch.float32, device=self.device)
+    cfg_step_times: list[float] | None = [] if profile_cfg else None
+    z = self._denoise(
+      z=z,
+      text_z_padding=text_z_padding,
+      llm_features=llm_features,
+      neg_llm_features=neg_llm_features,
+      inputs=inputs,
+      max_text_tokens=max_text_tokens,
+      num_steps=num_steps,
+      schedule=schedule,
+      step_intervals=step_intervals,
+      gw_per_step=gw_per_step,
+      use_batched_cfg=use_batched_cfg,
+      cfg_step_times_s=cfg_step_times,
+    )
 
-      pos_z = torch.cat([text_z_padding, z], dim=1)
-      pos_out = self.conditional_transformer(
-        llm_features=llm_features,
-        x=pos_z,
-        t=t,
-        position_ids=inputs["position_ids"],
-        segment_ids=inputs["segment_ids"],
-        indicator=inputs["indicator"],
+    if profile_cfg and cfg_step_times:
+      mode = "batched" if use_batched_cfg else "sequential"
+      total_ms = 1000.0 * sum(cfg_step_times)
+      per_step_ms = total_ms / len(cfg_step_times)
+      print(
+        f"CFG profiling ({mode}): {per_step_ms:.2f} ms/step "
+        f"({total_ms:.1f} ms total over {len(cfg_step_times)} steps)"
       )
-      pos_v = pos_out[:, max_text_tokens:]
-
-      neg_v = self.unconditional_transformer(
-        llm_features=neg_llm_features,
-        x=z,
-        t=t,
-        position_ids=neg_position_ids,
-        segment_ids=neg_segment_ids,
-        indicator=neg_indicator,
-      )
-
-      gw_i = gw_per_step[i]
-      v = gw_i * pos_v + (1.0 - gw_i) * neg_v
-      delta = s_val - t_val
-      z = z + v * delta
 
     return self._decode(z, grid_h=grid_h, grid_w=grid_w)  # type: ignore[arg-type]
 
